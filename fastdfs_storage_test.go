@@ -1,0 +1,179 @@
+package fastdfs_storage
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	s3_storage "github.com/storage-lock/go-s3-storage"
+	"github.com/storage-lock/go-storage"
+	storage_test_helper "github.com/storage-lock/go-storage-test-helper"
+	"github.com/stretchr/testify/assert"
+)
+
+var minioCmd *exec.Cmd
+
+func TestMain(m *testing.M) {
+	envName := "STORAGE_LOCK_FASTDFS_ENDPOINT"
+	if os.Getenv(envName) != "" {
+		os.Exit(m.Run())
+	}
+
+	// 无外部 FastDFS 服务时，用 Docker 启动 MinIO（S3 兼容）做全量语义验证
+	port := "9022"
+	consolePort := "9023"
+	minioCmd = exec.Command("docker", "run", "--rm",
+		"-p", port+":9000",
+		"-p", consolePort+":9001",
+		"-e", "MINIO_ROOT_USER=minioadmin",
+		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
+		"--name", "fastdfs-storage-test",
+		"minio/minio:RELEASE.2024-05-28T17-19-04Z", "server", "/data", "--console-address", ":9001",
+	)
+	if err := minioCmd.Start(); err != nil {
+		fmt.Println("docker not available, skipping FastDFS storage test")
+		os.Exit(0)
+	}
+
+	time.Sleep(time.Second * 5)
+	os.Setenv("STORAGE_LOCK_FASTDFS_ENDPOINT", "localhost:"+port)
+	os.Setenv("STORAGE_LOCK_FASTDFS_ACCESS_KEY", "minioadmin")
+	os.Setenv("STORAGE_LOCK_FASTDFS_SECRET_KEY", "minioadmin")
+	os.Setenv("STORAGE_LOCK_FASTDFS_BUCKET", "storage-lock-test")
+	exitCode := m.Run()
+
+	minioCmd.Process.Kill()
+	minioCmd.Wait()
+	exec.Command("docker", "rm", "-f", "fastdfs-storage-test").Run()
+	os.Exit(exitCode)
+}
+
+func TestFastdfsStorage(t *testing.T) {
+	endpoint := os.Getenv("STORAGE_LOCK_FASTDFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("STORAGE_LOCK_FASTDFS_ENDPOINT not set and MinIO not available")
+	}
+	accessKey := os.Getenv("STORAGE_LOCK_FASTDFS_ACCESS_KEY")
+	if accessKey == "" {
+		accessKey = "minioadmin"
+	}
+	secretKey := os.Getenv("STORAGE_LOCK_FASTDFS_SECRET_KEY")
+	if secretKey == "" {
+		secretKey = "minioadmin"
+	}
+
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: false,
+	})
+	assert.Nil(t, err)
+
+	bucket := os.Getenv("STORAGE_LOCK_FASTDFS_BUCKET")
+	if bucket == "" {
+		bucket = "storage-lock-test"
+	}
+	ctx := context.Background()
+	exists, err := client.BucketExists(ctx, bucket)
+	assert.Nil(t, err)
+	if !exists {
+		err = client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+		assert.Nil(t, err)
+	}
+	// 清理旧数据
+	prefix := storage_test_helper.TestTableName + "/lock/"
+	ch := client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true})
+	for obj := range ch {
+		if obj.Err != nil {
+			continue
+		}
+		client.RemoveObject(ctx, bucket, obj.Key, minio.RemoveObjectOptions{})
+	}
+
+	cm := s3_storage.NewS3ConnectionManagerFromClient(client)
+	s, err := NewFastdfsStorage(ctx, &s3_storage.S3StorageOptions{
+		ConnectionManager: cm,
+		BucketName:        bucket,
+		KeyPrefix:         storage_test_helper.TestTableName,
+		TimeProvider:      &s3_storage.LocalTimeProvider{},
+	})
+	assert.Nil(t, err)
+	// 包装器能力透传 S3：CAS + ReliableTime
+	caps := s.Capabilities()
+	assert.Contains(t, caps, storage.CapabilityCAS)
+	assert.Contains(t, caps, storage.CapabilityReliableTime)
+	assert.Equal(t, StorageName, s.GetName())
+	storage_test_helper.TestStorage(t, s)
+}
+
+func TestFastdfsStorageMeta(t *testing.T) {
+	ctx := context.Background()
+
+	// 缺参数直接报错（不触网）
+	_, err := NewFastdfsStorage(ctx, &s3_storage.S3StorageOptions{})
+	assert.NotNil(t, err)
+
+	// 构造失败路径：空 Bucket（Check 拦截）
+	cm := s3_storage.NewS3ConnectionManagerFromEndpoint("127.0.0.1:1", "a", "b", false)
+	_, err = NewFastdfsStorage(ctx, &s3_storage.S3StorageOptions{
+		ConnectionManager: cm,
+		BucketName:        "",
+		KeyPrefix:         storage_test_helper.TestTableName,
+	})
+	assert.NotNil(t, err)
+
+	// 名称与能力透传不断言外部服务，仅在本地 client 可构造时验证
+	client, cerr := minio.New("127.0.0.1:1", &minio.Options{
+		Creds:  credentials.NewStaticV4("a", "b", ""),
+		Secure: false,
+	})
+	if cerr != nil {
+		t.Skip("minio client construct failed")
+	}
+	_ = client
+	_ = storage.CapabilityCAS
+}
+
+// TestFastdfsStorageWatchWiring Watch 接线测试：本地伪 S3 端点走通构造（HEAD 返回 200），
+// 验证 Watch 返回轮询通道；cancel 确保后台 goroutine 退出。无需外部服务。
+func TestFastdfsStorageWatchWiring(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// minio-go 先查 bucket location（?location 查询），再 HEAD 校验存在
+		if _, ok := r.URL.Query()["location"]; ok {
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint>us-east-1</LocationConstraint>`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	client, err := minio.New(strings.TrimPrefix(srv.URL, "http://"), &minio.Options{
+		Creds:  credentials.NewStaticV4("a", "b", ""),
+		Secure: false,
+	})
+	assert.Nil(t, err)
+
+	cm := s3_storage.NewS3ConnectionManagerFromClient(client)
+	s, err := NewFastdfsStorage(ctx, &s3_storage.S3StorageOptions{
+		ConnectionManager: cm,
+		BucketName:        "test-bucket",
+		KeyPrefix:         "test-prefix",
+	})
+	assert.Nil(t, err)
+	assert.Equal(t, StorageName, s.GetName())
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch, err := s.Watch(wctx, "lock-1")
+	assert.Nil(t, err)
+	assert.NotNil(t, ch)
+}

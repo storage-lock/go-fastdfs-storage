@@ -2,6 +2,7 @@ package fastdfs_storage
 
 import (
 	"context"
+	"time"
 
 	s3_storage "github.com/storage-lock/go-s3-storage"
 	"github.com/storage-lock/go-storage"
@@ -28,4 +29,8 @@ func (x *FastdfsStorage) GetName() string {
 
 func (x *FastdfsStorage) Capabilities() []storage.StorageCapability {
 	return x.S3Storage.Capabilities()
+}
+
+func (x *FastdfsStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
